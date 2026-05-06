@@ -1,5 +1,14 @@
 import warnings
+import sys
+import os
 from pathlib import Path
+
+current_file = Path(__file__).resolve()
+
+project_path = current_file.parent.parent 
+
+if str(project_path.parent) not in sys.path:
+    sys.path.insert(0, str(project_path.parent))
 
 import pandas as pd
 import yfinance as yf
@@ -76,159 +85,116 @@ def generate_features(data):
 
 
 def get_label(train_data):
-    """Создаем разметку для ML модели на основе тройного барьерного метода. Его параметры захардкожены, но при желании вы можете вынести их в конфиг
-
-    Args:
-        train_data (pd.DataFrame): raw OHLC dataset
-
-    Returns:
-        pd.DataFrame: target dataset
-    """
-    target = train_data.Close.apply(three_barrier)
+    # Ratio of take-profit to stop-loss
+    target = train_data.Close.apply(lambda x: three_barrier(x, ptSl=[1, 1], horizon=15))
     return target
 
 
-def get_raw_data():
-    """Скачиваем OHLC данные, а также для каждого тикера определяем дату его первого вхождения в индекс
 
-    Returns:
-        pd.DataFrame: OHLC данные для всех акций, когда либо входивших в индекс S&P500
-        dict: Словарь, где ключ - тикер, значение - дата первого вхождения в индекс
-    """
+def get_raw_data():
     cfg = load_config(project_path.parent.as_posix() + "/config.yaml")
     TRAIN_START_DATE = cfg["train_start_date"]
     BACKTEST_END_DATE = cfg["backtest_end_date"]
 
-    # будем включать в выборку бумаг не только актуальных состав индекса, но и все исторические вхождения
-    # это должно убрать ошибку выжившего из датасета
     historical_components = pd.read_csv(
         project_path.as_posix() + "/data/pony/S&P_500_Historical_Components.csv",
         index_col=0,
+        parse_dates=True
     )
 
-    historical_components[
-        (historical_components.index >= TRAIN_START_DATE)
-        & (historical_components.index <= BACKTEST_END_DATE)
-    ]
-
-    first_appearance_dict = {}
-
-    for index, row in historical_components.iterrows():
-        for ticker in row[0].split(","):
-            if ticker not in first_appearance_dict:
-                first_appearance_dict[ticker] = index
-
-    # поправляем название некоторых тикеров, чтобы yfinance их распознал
-    first_appearance_dict["BF-B"] = first_appearance_dict.pop("BF.B")
-    first_appearance_dict["BRK-B"] = first_appearance_dict.pop("BRK.B")
-
-    # для этих акций yfinance предоставлет битые данные (нулевые или околонулевые цены для некоторых периодов в прошлом, которые ломают алгоритм)
-    # можете изучить их котировки и если yfinance цены истинны, то оставить тикеры в выборке, пока же мы их удалим
-    for trash_ticker in ("DEC", "USBC", "CPWR", "TNB", "APP", "BMC", "SBNY"):
-        first_appearance_dict.pop(trash_ticker)
-
-    TICKERS = list(first_appearance_dict.keys())
-
+    # Собираем все тикеры
+    all_tickers = set()
+    for row in historical_components['tickers']:
+        all_tickers.update(str(row).split(','))
+    
+    TICKERS = sorted([t.replace('.', '-') for t in all_tickers])
+    
+    print(f"Downloading {len(TICKERS)} tickers (Sequential mode, please wait)...")
+    
+    # Отключаем потоки (threads=False), чтобы не злить сервера Yahoo
     data = yf.download(
-        TICKERS,
-        TRAIN_START_DATE,
-        BACKTEST_END_DATE,
-        group_by="column",
+        TICKERS, 
+        start=TRAIN_START_DATE, 
+        end=BACKTEST_END_DATE, 
+        group_by="column", 
         auto_adjust=True,
+        threads=False 
     )
 
-    # yahoo finance иногда выдает фантомные колонки по тикерам с неполными данными
-    if "Adj Close" in data.columns:
-        data.drop(columns="Adj Close", inplace=True)
+    data.dropna(axis=1, how='all', inplace=True)
+    
+    # Приводим к единому формату
+    if not isinstance(data.columns, pd.MultiIndex):
+        data.columns = pd.MultiIndex.from_product([['Close'], data.columns])
+        
+    # --- БЛОК ВАЛИДАЦИИ КАЧЕСТВА ДАННЫХ ---
+    downloaded_tickers = data.columns.get_level_values(1).unique()
+    must_have_tickers = ['NVDA', 'AAPL', 'MSFT', 'META', 'AMZN']
+    
+    missing = [t for t in must_have_tickers if t not in downloaded_tickers]
+    
+    if missing:
+        raise ValueError(f"ОШИБКА YAHOO: Не скачались ключевые тикеры: {missing}. Запустите скрипт еще раз через пару минут.")
+    else:
+        print(f"Успех! База скачана отлично. Доступно {len(downloaded_tickers)} тикеров.")
+    # ---------------------------------------
+    
+    return data, historical_components
 
-    data.index = pd.to_datetime(data.index)
-    data = data.astype(float)
-
-    return (
-        data,
-        first_appearance_dict,
-    )
 
 
 def get_data():
-    """Скачиваем сырые данные, строим на их основе фичасеты и таргеты для наших тикеров и сохраняем сырые и обработанные данные"""
     cfg = load_config(project_path.parent.as_posix() + "/config.yaml")
+    
+    # Создаем папки
+    for folder in ["/data/raw", "/data/processed", "/models", "/artifacts/metrics", "/artifacts/plots"]:
+        os.makedirs(project_path.as_posix() + folder, exist_ok=True)
 
-    (
-        data,
-        first_appearance_dict,
-    ) = get_raw_data()
+    data, historical_components = get_raw_data()
 
-    # генерируем фичи для ML модели
+    # Генерируем фичи и таргеты
     X = generate_features(data)
-
-    # генерируем столбец таргета
     y = get_label(data)
 
+    # Переводим в длинный формат (Stack)
     X = X.stack(level=1)
+    y = y.stack() # Это превратит DF в Series с MultiIndex (Date, Ticker)
 
-    TRAIN_START_DATE = cfg["train_start_date"]
-    TRAIN_END_DATE = cfg["train_end_date"]
-    BACKTEST_START_DATE = cfg["backtest_start_date"]
-    BACKTEST_END_DATE = cfg["backtest_end_date"]
-
-    # для каждого тикера определяем дату первого вхождения в индекс
-    for ticker, first_appearance_dt in first_appearance_dict.items():
-        condition_to_drop = (X.index.get_level_values("Date") < first_appearance_dt) & (
-            X.index.get_level_values("Ticker") == ticker
-        )
-        X = X[~condition_to_drop]
-
-    idx = pd.IndexSlice
-    data = data.loc[:, idx[:, X.index.get_level_values("Ticker").unique()]]
-    y = y.stack(level=0).loc[X.index]
+    # Оставляем только те (Дата, Тикер), которые есть в обоих датасетах
+    common_index = X.index.intersection(y.index)
+    X = X.loc[common_index]
+    y = y.loc[common_index]
     y.name = "target"
 
-    # разбиваем исходные данные на трейн и бэктест
-    train_data = data[
-        (data.index.get_level_values("Date") <= TRAIN_END_DATE)
-        & (data.index.get_level_values("Date") >= TRAIN_START_DATE)
-    ]
-    train_data.to_parquet(project_path.as_posix() + "/data/raw/train_data.parquet")
+    # Создаем маску для борьбы с Survivorship Bias
+    mask = pd.DataFrame(0, index=data.index, columns=data.columns.get_level_values(1).unique())
+    for date, row in historical_components.iterrows():
+        actual_dates = mask.index[mask.index >= date]
+        if len(actual_dates) > 0:
+            active = [t.replace('.', '-') for t in str(row['tickers']).split(',')]
+            valid = [t for t in active if t in mask.columns]
+            mask.loc[actual_dates[0]:, mask.columns] = 0
+            mask.loc[actual_dates[0]:, valid] = 1
+    
+    mask.to_parquet(project_path.as_posix() + "/data/processed/universe_mask.parquet")
 
-    backtest_data = data[
-        (data.index.get_level_values("Date") <= BACKTEST_END_DATE)
-        & (data.index.get_level_values("Date") >= BACKTEST_START_DATE)
-    ]
+    # Сохранение данных
+    TRAIN_END = cfg["train_end_date"]
+    TEST_START = cfg["backtest_start_date"]
 
-    backtest_data.to_parquet(
-        project_path.as_posix() + "/data/raw/backtest_data.parquet", engine="pyarrow"
-    )
+    # Сырые данные для бэктеста
+    data.to_parquet(project_path.as_posix() + "/data/raw/backtest_data.parquet")
 
-    # разбиваем фичасеты и таргеты ML модели на трейн и бэктест
-    X_train = X[
-        (X.index.get_level_values("Date") <= TRAIN_END_DATE)
-        & (X.index.get_level_values("Date") >= TRAIN_START_DATE)
-    ]
-    X_train.to_parquet(project_path.as_posix() + "/data/processed/X_train.parquet")
+    # Обработанные данные для ML
+    X.loc[:TRAIN_END].to_parquet(project_path.as_posix() + "/data/processed/X_train.parquet")
+    y.loc[:TRAIN_END].to_frame().to_parquet(project_path.as_posix() + "/data/processed/y_train.parquet")
+    
+    X.loc[TEST_START:].to_parquet(project_path.as_posix() + "/data/processed/X_backtest.parquet")
+    y.loc[TEST_START:].to_frame().to_parquet(project_path.as_posix() + "/data/processed/y_backtest.parquet")
 
-    y_train = y.to_frame()[
-        (y.index.get_level_values("Date") <= TRAIN_END_DATE)
-        & (y.index.get_level_values("Date") >= TRAIN_START_DATE)
-    ]
-    y_train.to_parquet(project_path.as_posix() + "/data/processed/y_train.parquet")
-
-    X_backtest = X[
-        (X.index.get_level_values("Date") <= BACKTEST_END_DATE)
-        & (X.index.get_level_values("Date") >= BACKTEST_START_DATE)
-    ]
-    X_backtest.to_parquet(
-        project_path.as_posix() + "/data/processed/X_backtest.parquet"
-    )
-
-    y_backtest = y.to_frame()[
-        (y.index.get_level_values("Date") <= BACKTEST_END_DATE)
-        & (y.index.get_level_values("Date") >= BACKTEST_START_DATE)
-    ]
-    y_backtest.to_parquet(
-        project_path.as_posix() + "/data/processed/y_backtest.parquet"
-    )
 
 
 if __name__ == "__main__":
     get_data()
+
+
